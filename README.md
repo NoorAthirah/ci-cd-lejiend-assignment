@@ -409,3 +409,4 @@ Develop → Push → CI: Validate → CD: Deploy → CD: Verify
 
 The main achievement is a repeatable CI/CD process that validates every change before automatically deploying the Node.js application and its MySQL dependency.
 # ci-cd-lejiend-assignment
+# ci-cd-lejiend-assignment
