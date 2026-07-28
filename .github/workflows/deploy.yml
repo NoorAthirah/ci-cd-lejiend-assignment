@@ -1,0 +1,163 @@
+name: CI/CD - Validate and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  continuous-integration:
+    name: CI - Validate Application
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Run automated tests
+        run: npm test
+
+      - name: Create validation environment
+        run: cp .env.example .env
+
+      - name: Validate application Compose file
+        run: docker compose config --quiet
+
+      - name: Validate MySQL Compose file
+        run: docker compose --env-file .env -f database/mysql/docker-compose.yml config --quiet
+
+      - name: Build application image
+        run: docker build --tag ci-cd-lejiend-assignment:${{ github.sha }} .
+
+  continuous-deployment:
+    name: CD - Deploy to Ubuntu Server
+    needs: continuous-integration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: production
+
+    steps:
+      - name: Check out validated repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keyscan -p "$SERVER_PORT" -H "$SERVER_HOST" >> "$HOME/.ssh/known_hosts"
+
+      - name: Prepare deployment directory
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i "$HOME/.ssh/deploy_key" -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "mkdir -p /opt/ci-cd-lejiend-assignment"
+
+      - name: Transfer validated project
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          rsync -az --delete \
+            --exclude='.git/' \
+            --exclude='.env' \
+            --exclude='node_modules/' \
+            -e "ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT" \
+            ./ "$SERVER_USER@$SERVER_HOST:/opt/ci-cd-lejiend-assignment/"
+
+      - name: Create production environment file
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          APP_PORT: ${{ secrets.APP_PORT }}
+          APP_NAME: ${{ secrets.APP_NAME }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD }}
+        run: |
+          umask 077
+          {
+            printf 'PORT=%s\n' "$APP_PORT"
+            printf 'NODE_ENV=production\n'
+            printf 'APP_NAME=%s\n' "$APP_NAME"
+            printf 'DB_HOST=mysql\n'
+            printf 'DB_PORT=3306\n'
+            printf 'DB_NAME=%s\n' "$DB_NAME"
+            printf 'DB_USER=%s\n' "$DB_USER"
+            printf 'DB_PASSWORD=%s\n' "$DB_PASSWORD"
+            printf 'DB_ROOT_PASSWORD=%s\n' "$DB_ROOT_PASSWORD"
+          } > production.env
+
+          scp -i "$HOME/.ssh/deploy_key" -P "$SERVER_PORT" \
+            production.env \
+            "$SERVER_USER@$SERVER_HOST:/opt/ci-cd-lejiend-assignment/.env"
+          rm -f production.env
+
+      - name: Start MySQL and deploy Node.js
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i "$HOME/.ssh/deploy_key" -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/ci-cd-lejiend-assignment
+          docker compose --env-file .env -f database/mysql/docker-compose.yml up -d
+
+          for attempt in $(seq 1 30); do
+            database_status="$(docker inspect --format='{{.State.Health.Status}}' lejiend-assignment-mysql 2>/dev/null || true)"
+            if [ "$database_status" = "healthy" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker compose --env-file .env -f database/mysql/docker-compose.yml logs --tail=100
+              exit 1
+            fi
+            sleep 5
+          done
+
+          docker compose up --build -d
+          REMOTE
+
+      - name: CD verification - check deployed application and database
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          APP_PORT: ${{ secrets.APP_PORT }}
+        run: |
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --show-error \
+              "http://$SERVER_HOST:$APP_PORT/health"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1

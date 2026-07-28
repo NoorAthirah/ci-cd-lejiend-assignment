@@ -1,0 +1,22 @@
+{
+  "name": "ci-cd-lejiend-assignment",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ready-made Node.js, MySQL, Docker and GitHub Actions CI/CD assignment",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "mysql2": "^3.14.1"
+  },
+  "devDependencies": {
+    "supertest": "^7.1.1"
+  }
+}
